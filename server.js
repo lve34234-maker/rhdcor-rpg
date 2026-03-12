@@ -212,6 +212,24 @@ function getUserParty(username) {
   return Object.values(parties).find(p => p.members.includes(username)) || null;
 }
 
+function getStageUsers(stageId, excludeUsername) {
+  const result = [];
+  for (const [, info] of clients) {
+    if (info.stageId === stageId && info.username !== excludeUsername) {
+      result.push(info.username);
+    }
+  }
+  return result;
+}
+
+function broadcastToStage(stageId, msg, excludeUsername) {
+  for (const [ws, info] of clients) {
+    if (info.stageId === stageId && info.username !== excludeUsername) {
+      try { ws.send(JSON.stringify(msg)); } catch(e) {}
+    }
+  }
+}
+
 function broadcastPartyList() {
   const openParties = Object.values(parties).filter(p => p.members.length < 3);
   broadcast({ type: 'party_list', parties: openParties });
@@ -227,7 +245,11 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     const info = clients.get(ws);
     if (info) {
-      const { username } = info;
+      const { username, stageId } = info;
+      // 스테이지에서 나감 알림
+      if (stageId) {
+        broadcastToStage(stageId, { type: 'stage_user_left', username, stageId }, username);
+      }
       // 파티에서 제거
       const party = getUserParty(username);
       if (party) {
@@ -250,7 +272,7 @@ function handleWS(ws, msg) {
   if (msg.type === 'auth') {
     const u = users[msg.username];
     if (u && u.password === msg.password) {
-      clients.set(ws, { username: msg.username });
+      clients.set(ws, { username: msg.username, stageId: null });
       ws.send(JSON.stringify({ type: 'auth_ok', user: sanitize(u) }));
       broadcast({ type: 'online', users: getOnlineUsers() });
       // Send recent chat history
@@ -447,6 +469,31 @@ function handleWS(ws, msg) {
     party.members.forEach(m => {
       if (m !== username) sendToUser(m, { type: 'party_battle_sync', username, ...msg });
     });
+    return;
+  }
+
+  // ====== 같은 스테이지 유저 표시 ======
+  if (msg.type === 'stage_enter') {
+    const info = clients.get(ws);
+    if (!info) return;
+    info.stageId = msg.stageId;
+    // 이 스테이지에 있는 다른 유저 목록 수집
+    const stageUsers = getStageUsers(msg.stageId, username);
+    // 나한테: 이미 여기 있는 유저 목록 전송
+    ws.send(JSON.stringify({ type: 'stage_users', stageId: msg.stageId, users: stageUsers }));
+    // 다른 유저들한테: 내가 들어왔다고 알림
+    broadcastToStage(msg.stageId, { type: 'stage_user_joined', username, stageId: msg.stageId }, username);
+    return;
+  }
+
+  if (msg.type === 'stage_leave') {
+    const info = clients.get(ws);
+    if (!info) return;
+    const prevStage = info.stageId;
+    info.stageId = null;
+    if (prevStage) {
+      broadcastToStage(prevStage, { type: 'stage_user_left', username, stageId: prevStage }, username);
+    }
     return;
   }
 }
