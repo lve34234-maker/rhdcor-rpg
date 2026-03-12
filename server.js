@@ -6,7 +6,11 @@ const path = require('path');
 const cors = require('cors');
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 const DATA_FILE = path.join(__dirname, 'data', 'users.json');
