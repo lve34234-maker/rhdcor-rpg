@@ -362,9 +362,22 @@ function handleWS(ws, msg) {
     if (party.members.length >= 3) { ws.send(JSON.stringify({ type: 'system', msg: '파티가 가득 찼습니다.' })); return; }
     if (getUserParty(username)) { ws.send(JSON.stringify({ type: 'system', msg: '이미 파티에 속해 있습니다.' })); return; }
     party.members.push(username);
+    const memberSlot = party.members.indexOf(username);
     // 모든 파티원에게 업데이트
     party.members.forEach(m => sendToUser(m, { type: 'party_update', party }));
     ws.send(JSON.stringify({ type: 'system', msg: `파티 [${party.name}] 참가 완료!` }));
+    // 파티가 이미 전투 중이면 즉시 해당 전장으로 순간이동
+    if (party.inBattle && party.stageId) {
+      ws.send(JSON.stringify({
+        type: 'party_battle_start',
+        party,
+        stageId: party.stageId,
+        memberSlot,
+        wave: party.currentWave || 1,
+        instant: true  // 순간이동 플래그
+      }));
+      ws.send(JSON.stringify({ type: 'system', msg: `⚡ 전투 중인 파티에 합류! 스테이지 ${party.stageId}` }));
+    }
     broadcastPartyList();
     return;
   }
@@ -401,9 +414,29 @@ function handleWS(ws, msg) {
     const party = getUserParty(username);
     if (!party || party.leader !== username) return;
     party.stageId = msg.stageId;
+    party.inBattle = true;
+    party.currentWave = 1;
     party.members.forEach((m, i) => {
-      sendToUser(m, { type: 'party_battle_start', party, stageId: msg.stageId, memberSlot: i });
+      sendToUser(m, { type: 'party_battle_start', party, stageId: msg.stageId, memberSlot: i, wave: 1 });
     });
+    return;
+  }
+
+  if (msg.type === 'party_wave_update') {
+    // 파티장이 웨이브 진행 상황 서버에 알림
+    const party = getUserParty(username);
+    if (party && party.leader === username) {
+      party.currentWave = msg.wave;
+    }
+    return;
+  }
+
+  if (msg.type === 'party_battle_end') {
+    const party = getUserParty(username);
+    if (party && party.leader === username) {
+      party.inBattle = false;
+      party.currentWave = 1;
+    }
     return;
   }
 
