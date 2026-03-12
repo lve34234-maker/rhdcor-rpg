@@ -206,6 +206,16 @@ const wss = new WebSocketServer({ server });
 // Online players
 const clients = new Map(); // ws -> { username }
 const chatHistory = { global: [], guild: [], party: [], trade: [] };
+const parties = {}; // partyId -> { id, name, leader, members, stageId }
+
+function getUserParty(username) {
+  return Object.values(parties).find(p => p.members.includes(username)) || null;
+}
+
+function broadcastPartyList() {
+  const openParties = Object.values(parties).filter(p => p.members.length < 3);
+  broadcast({ type: 'party_list', parties: openParties });
+}
 
 wss.on('connection', (ws) => {
   ws.on('message', (raw) => {
@@ -217,6 +227,19 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     const info = clients.get(ws);
     if (info) {
+      const { username } = info;
+      // 파티에서 제거
+      const party = getUserParty(username);
+      if (party) {
+        party.members = party.members.filter(m => m !== username);
+        if (party.members.length === 0 || party.leader === username) {
+          party.members.forEach(m => sendToUser(m, { type: 'party_disbanded' }));
+          delete parties[party.id];
+        } else {
+          party.leader = party.members[0];
+          party.members.forEach(m => sendToUser(m, { type: 'party_update', party }));
+        }
+      }
       clients.delete(ws);
       broadcast({ type: 'online', users: getOnlineUsers() });
     }
@@ -310,6 +333,87 @@ function handleWS(ws, msg) {
     }
     saveUsers(users);
     ws.send(JSON.stringify({ type: 'save_ok' }));
+    return;
+  }
+
+  // ====== 파티 시스템 ======
+  if (msg.type === 'party_list_request') {
+    const openParties = Object.values(parties).filter(p => p.members.length < 3);
+    ws.send(JSON.stringify({ type: 'party_list', parties: openParties }));
+    return;
+  }
+
+  if (msg.type === 'party_create') {
+    if (getUserParty(username)) {
+      ws.send(JSON.stringify({ type: 'system', msg: '이미 파티에 속해 있습니다.' }));
+      return;
+    }
+    const partyId = 'party_' + Date.now();
+    parties[partyId] = { id: partyId, name: msg.name, leader: username, members: [username] };
+    ws.send(JSON.stringify({ type: 'party_update', party: parties[partyId] }));
+    ws.send(JSON.stringify({ type: 'system', msg: `파티 [${msg.name}] 생성 완료!` }));
+    broadcastPartyList();
+    return;
+  }
+
+  if (msg.type === 'party_join') {
+    const party = parties[msg.partyId];
+    if (!party) { ws.send(JSON.stringify({ type: 'system', msg: '파티를 찾을 수 없습니다.' })); return; }
+    if (party.members.length >= 3) { ws.send(JSON.stringify({ type: 'system', msg: '파티가 가득 찼습니다.' })); return; }
+    if (getUserParty(username)) { ws.send(JSON.stringify({ type: 'system', msg: '이미 파티에 속해 있습니다.' })); return; }
+    party.members.push(username);
+    // 모든 파티원에게 업데이트
+    party.members.forEach(m => sendToUser(m, { type: 'party_update', party }));
+    ws.send(JSON.stringify({ type: 'system', msg: `파티 [${party.name}] 참가 완료!` }));
+    broadcastPartyList();
+    return;
+  }
+
+  if (msg.type === 'party_leave') {
+    const party = getUserParty(username);
+    if (!party) return;
+    party.members = party.members.filter(m => m !== username);
+    if (party.members.length === 0 || party.leader === username) {
+      // 파티 해산
+      party.members.forEach(m => sendToUser(m, { type: 'party_disbanded' }));
+      delete parties[party.id];
+    } else {
+      // 새 리더 지정
+      party.leader = party.members[0];
+      party.members.forEach(m => sendToUser(m, { type: 'party_update', party }));
+    }
+    ws.send(JSON.stringify({ type: 'party_disbanded' }));
+    broadcastPartyList();
+    return;
+  }
+
+  if (msg.type === 'party_kick') {
+    const party = getUserParty(username);
+    if (!party || party.leader !== username) return;
+    party.members = party.members.filter(m => m !== msg.target);
+    sendToUser(msg.target, { type: 'party_kicked' });
+    party.members.forEach(m => sendToUser(m, { type: 'party_update', party }));
+    broadcastPartyList();
+    return;
+  }
+
+  if (msg.type === 'party_start_battle') {
+    const party = getUserParty(username);
+    if (!party || party.leader !== username) return;
+    party.stageId = msg.stageId;
+    party.members.forEach((m, i) => {
+      sendToUser(m, { type: 'party_battle_start', party, stageId: msg.stageId, memberSlot: i });
+    });
+    return;
+  }
+
+  if (msg.type === 'party_battle_action') {
+    const party = getUserParty(username);
+    if (!party) return;
+    // 파티원들에게 전투 액션 브로드캐스트
+    party.members.forEach(m => {
+      if (m !== username) sendToUser(m, { type: 'party_battle_sync', username, ...msg });
+    });
     return;
   }
 }
