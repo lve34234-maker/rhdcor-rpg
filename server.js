@@ -186,10 +186,26 @@ app.get('/api/user/:name', (req, res) => {
 });
 
 app.post('/api/admin/setuser', (req, res) => {
-  const { adminPass, target, field, value } = req.body;
-  if (!users['admin'] || users['admin'].password !== adminPass) return res.json({ ok: false });
+  const { adminUser, adminPass, target, field, value } = req.body;
+  // 요청한 사람이 어드민인지 확인 (어느 어드민이든 가능)
+  const requester = adminUser ? users[adminUser] : users['admin'];
+  if (!requester || !requester.isAdmin || requester.password !== adminPass) {
+    return res.json({ ok: false, msg: '권한 없음' });
+  }
   if (!users[target]) return res.json({ ok: false, msg: 'User not found' });
   users[target][field] = value;
+  saveUsers(users);
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/makeadmin', (req, res) => {
+  const { adminUser, adminPass, target, grant } = req.body;
+  const requester = adminUser ? users[adminUser] : users['admin'];
+  if (!requester || !requester.isAdmin || requester.password !== adminPass) {
+    return res.json({ ok: false, msg: '권한 없음' });
+  }
+  if (!users[target]) return res.json({ ok: false, msg: '유저 없음' });
+  users[target].isAdmin = grant ? true : false;
   saveUsers(users);
   res.json({ ok: true });
 });
