@@ -319,6 +319,7 @@ function handleWS(ws, msg) {
       username,
       text,
       isAdmin: user?.isAdmin || false,
+      userLevel: user?.level || 1,
       ts: Date.now()
     };
     if (!chatHistory[channel]) chatHistory[channel] = [];
@@ -525,14 +526,16 @@ function handleWS(ws, msg) {
     const villagers = [];
     for (const [, ci] of clients) {
       if (ci.inVillage && ci.username !== username) {
-        villagers.push({ username: ci.username, x: ci.villageX, y: ci.villageY, heroClass: ci.heroClass || 0 });
+        const u = users[ci.username] || {};
+        villagers.push({ username: ci.username, x: ci.villageX, y: ci.villageY, heroClass: ci.heroClass || 0, level: u.level || 1 });
       }
     }
     ws.send(JSON.stringify({ type: 'village_players', players: villagers }));
     // Announce arrival
+    const myUser = users[username] || {};
     for (const [ow, oi] of clients) {
       if (oi.inVillage && oi.username !== username) {
-        ow.send(JSON.stringify({ type: 'village_player_join', username, x: info.villageX, y: info.villageY, heroClass: info.heroClass }));
+        ow.send(JSON.stringify({ type: 'village_player_join', username, x: info.villageX, y: info.villageY, heroClass: info.heroClass, level: myUser.level || 1 }));
       }
     }
     return;
