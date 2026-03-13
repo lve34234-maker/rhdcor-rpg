@@ -496,6 +496,56 @@ function handleWS(ws, msg) {
     }
     return;
   }
+
+  // ====== VILLAGE ======
+  if (msg.type === 'village_enter') {
+    const info = clients.get(ws);
+    if (!info) return;
+    info.inVillage = true;
+    info.villageX = msg.x || 50;
+    info.villageY = msg.y || 60;
+    info.heroClass = msg.heroClass || 0;
+    // Send current village players to newcomer
+    const villagers = [];
+    for (const [, ci] of clients) {
+      if (ci.inVillage && ci.username !== username) {
+        villagers.push({ username: ci.username, x: ci.villageX, y: ci.villageY, heroClass: ci.heroClass || 0 });
+      }
+    }
+    ws.send(JSON.stringify({ type: 'village_players', players: villagers }));
+    // Announce arrival
+    for (const [ow, oi] of clients) {
+      if (oi.inVillage && oi.username !== username) {
+        ow.send(JSON.stringify({ type: 'village_player_join', username, x: info.villageX, y: info.villageY, heroClass: info.heroClass }));
+      }
+    }
+    return;
+  }
+
+  if (msg.type === 'village_move') {
+    const info = clients.get(ws);
+    if (!info || !info.inVillage) return;
+    info.villageX = msg.x;
+    info.villageY = msg.y;
+    for (const [ow, oi] of clients) {
+      if (oi.inVillage && oi.username !== username) {
+        ow.send(JSON.stringify({ type: 'village_player_move', username, x: msg.x, y: msg.y }));
+      }
+    }
+    return;
+  }
+
+  if (msg.type === 'village_leave') {
+    const info = clients.get(ws);
+    if (!info) return;
+    info.inVillage = false;
+    for (const [ow, oi] of clients) {
+      if (oi.inVillage && oi.username !== username) {
+        ow.send(JSON.stringify({ type: 'village_player_leave', username }));
+      }
+    }
+    return;
+  }
 }
 
 function handleAdminCommand(ws, username, text, channel) {
