@@ -210,6 +210,26 @@ app.post('/api/admin/makeadmin', (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/delete-account', (req, res) => {
+  const { username, password } = req.body;
+  if (!users[username]) return res.json({ ok: false, msg: '유저 없음' });
+  if (users[username].password !== password) return res.json({ ok: false, msg: '비밀번호 오류' });
+  if (users[username].isAdmin && username === 'admin') return res.json({ ok: false, msg: 'admin 계정은 삭제 불가' });
+  delete users[username];
+  saveUsers(users);
+  res.json({ ok: true });
+});
+
+app.get('/api/backup/:username/:password', (req, res) => {
+  const { username, password } = req.params;
+  const u = users[username];
+  if (!u || u.password !== password) return res.status(403).json({ ok: false });
+  const { password: _, ...safeData } = u;
+  res.setHeader('Content-Disposition', `attachment; filename="${username}_backup.json"`);
+  res.setHeader('Content-Type', 'application/json');
+  res.json({ version: 1, username, exportedAt: new Date().toISOString(), data: safeData });
+});
+
 function sanitize(u) {
   const { password, ...rest } = u;
   return rest;
