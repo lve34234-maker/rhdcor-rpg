@@ -14,9 +14,19 @@ app.use(cors({
 app.use(express.json());
 
 const DATA_FILE = path.join(__dirname, 'data', 'users.json');
-if (!fs.existsSync(path.join(__dirname, 'data'))) {
-  fs.mkdirSync(path.join(__dirname, 'data'));
-}
+
+// Railway에서 /data 폴더가 없을 수 있으므로 강제 생성
+try {
+  fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
+} catch(e) {}
+
+// 예외 처리 - 서버 크래시 방지
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught Exception:', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ Unhandled Rejection:', reason);
+});
 
 function getAllWeapons() {
   return [
