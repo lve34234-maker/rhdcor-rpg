@@ -134,9 +134,17 @@ function loadUsers() {
   }
 }
 
-function saveUsers(users) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(users, null, 2));
+const CONFIG_FILE = path.join(__dirname, 'data', 'config.json');
+
+function loadConfig() {
+  try {
+    if (!fs.existsSync(CONFIG_FILE)) return { stageOverrides: {}, monsterStatOverrides: {}, adminPermissions: {} };
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch(e) { return { stageOverrides: {}, monsterStatOverrides: {}, adminPermissions: {} }; }
 }
+function saveConfig(cfg) { fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2)); }
+
+let gameConfig = loadConfig();
 
 let users = loadUsers();
 // Auto-save every 30s
@@ -171,6 +179,32 @@ app.post('/api/save', (req, res) => {
   if (!user || user.password !== password) return res.json({ ok: false, msg: 'Auth failed' });
   Object.assign(users[username], data);
   saveUsers(users);
+  res.json({ ok: true });
+});
+
+app.get('/api/config', (req, res) => {
+  res.json({ ok: true, config: gameConfig });
+});
+
+app.post('/api/admin/save-config', (req, res) => {
+  const { adminUser, adminPass, type, data } = req.body;
+  const requester = users[adminUser];
+  if (!requester || !requester.isAdmin || requester.password !== adminPass) {
+    return res.json({ ok: false, msg: '권한 없음' });
+  }
+  // 부관리자 권한 체크
+  if (!requester.isSuperAdmin && adminUser !== 'admin') {
+    const perms = gameConfig.adminPermissions?.[adminUser] || {};
+    if (type === 'stage' && !perms.canEditStages) return res.json({ ok: false, msg: '스테이지 편집 권한 없음' });
+    if (type === 'monster' && !perms.canEditMonsters) return res.json({ ok: false, msg: '몬스터 편집 권한 없음' });
+    if (type === 'permissions') return res.json({ ok: false, msg: '권한 편집은 최고 관리자만 가능' });
+  }
+  if (type === 'stage') gameConfig.stageOverrides = data;
+  else if (type === 'monster') gameConfig.monsterStatOverrides = data;
+  else if (type === 'permissions') gameConfig.adminPermissions = data;
+  saveConfig(gameConfig);
+  // 모든 유저에게 config 업데이트 브로드캐스트
+  broadcast({ type: 'config_update', config: gameConfig });
   res.json({ ok: true });
 });
 
