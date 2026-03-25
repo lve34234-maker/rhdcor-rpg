@@ -548,12 +548,52 @@ function handleWS(ws, msg) {
     const info = clients.get(ws);
     if (!info) return;
     info.stageId = msg.stageId;
-    // 이 스테이지에 있는 다른 유저 목록 수집
-    const stageUsers = getStageUsers(msg.stageId, username);
-    // 나한테: 이미 여기 있는 유저 목록 전송
-    ws.send(JSON.stringify({ type: 'stage_users', stageId: msg.stageId, users: stageUsers }));
-    // 다른 유저들한테: 내가 들어왔다고 알림
-    broadcastToStage(msg.stageId, { type: 'stage_user_joined', username, stageId: msg.stageId }, username);
+    info.mapX = msg.x || 5;
+    info.mapY = msg.y || 50;
+    info.heroClass = msg.heroClass || 0;
+    // 이 스테이지에 있는 다른 유저 목록 수집 (위치 포함)
+    const stageUsers = [];
+    for (const [, ci] of clients) {
+      if (ci.stageId === msg.stageId && ci.username !== username) {
+        stageUsers.push({ username: ci.username, x: ci.mapX||5, y: ci.mapY||50, heroClass: ci.heroClass||0, level: (users[ci.username]||{}).level||1 });
+      }
+    }
+    ws.send(JSON.stringify({ type: 'stage_users', stageId: msg.stageId, users: stageUsers.map(u=>u.username), players: stageUsers }));
+    broadcastToStage(msg.stageId, { type: 'stage_user_joined', username, stageId: msg.stageId, x: info.mapX, y: info.mapY, heroClass: info.heroClass, level: (users[username]||{}).level||1 }, username);
+    return;
+  }
+
+  if (msg.type === 'stage_map_move') {
+    const info = clients.get(ws);
+    if (!info || !info.stageId) return;
+    info.mapX = msg.x;
+    info.mapY = msg.y;
+    broadcastToStage(info.stageId, { type: 'stage_player_move', username, x: msg.x, y: msg.y }, username);
+    return;
+  }
+
+  if (msg.type === 'pvp_challenge') {
+    const target = msg.target;
+    sendToUser(target, { type: 'pvp_challenge', from: username, fromLevel: (users[username]||{}).level||1 });
+    return;
+  }
+
+  if (msg.type === 'pvp_accept') {
+    const challenger = msg.challenger;
+    // 양쪽에게 PvP 시작 신호
+    sendToUser(challenger, { type: 'pvp_start', opponent: username, opponentStats: sanitize(users[username]||{}) });
+    ws.send(JSON.stringify({ type: 'pvp_start', opponent: challenger, opponentStats: sanitize(users[challenger]||{}) }));
+    return;
+  }
+
+  if (msg.type === 'pvp_decline') {
+    sendToUser(msg.challenger, { type: 'pvp_declined', from: username });
+    return;
+  }
+
+  if (msg.type === 'pvp_result') {
+    // 승자가 서버에 결과 알림
+    sendToUser(msg.loser, { type: 'pvp_lost', winner: username });
     return;
   }
 
