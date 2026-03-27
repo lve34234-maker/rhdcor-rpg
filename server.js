@@ -13,20 +13,96 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// 데이터 폴더 먼저 생성 (loadUsers/loadBans보다 선행해야 함)
+try { fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true }); } catch {}
+
 const DATA_FILE = path.join(__dirname, 'data', 'users.json');
+const BAN_FILE  = path.join(__dirname, 'data', 'bans.json');
+const LOG_FILE  = path.join(__dirname, 'data', 'chatlog.json');
 
-// Railway에서 /data 폴더가 없을 수 있으므로 강제 생성
-try {
-  fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
-} catch(e) {}
+// ── 채팅 검열 시스템 ──
+const CHAT_FILTER_KO = [
+  '시발','씨발','개새끼','ㅅㅂ','ㅆㅂ','병신','지랄','꺼져','죽어','닥쳐',
+  '바보','멍청','쓰레기','개소리','미친','존나','ㅈㄴ','개떡','개같','사기꾼',
+  'fuck','shit','bitch','asshole','damn','crap','idiot','stupid',
+  '해킹','핵쓰','핵유저','어드민','무적','치트',
+];
+const SPAM_TRACKER = new Map(); // username -> {count, lastTime}
 
-// 예외 처리 - 서버 크래시 방지
-process.on('uncaughtException', (err) => {
-  console.error('⚠️ Uncaught Exception:', err.message);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('⚠️ Unhandled Rejection:', reason);
-});
+function filterChat(text, username) {
+  if (!text || typeof text !== 'string') return { ok: false, reason: 'empty' };
+  const trimmed = text.trim().slice(0, 200);
+  if (!trimmed) return { ok: false, reason: 'empty' };
+
+  // Spam check: max 4 messages per 3 seconds
+  const now = Date.now();
+  const st = SPAM_TRACKER.get(username) || { count: 0, lastTime: 0 };
+  if (now - st.lastTime > 3000) { st.count = 1; st.lastTime = now; }
+  else { st.count++; }
+  SPAM_TRACKER.set(username, st);
+  if (st.count > 5) return { ok: false, reason: 'spam', filtered: '⚠️ [스팸 감지됨]' };
+
+  // Bad word filter (regex lastIndex 버그 수정)
+  let filtered = trimmed;
+  let hasBad = false;
+  for (const w of CHAT_FILTER_KO) {
+    const re = new RegExp(w.split('').join('[\\s\\*]*'), 'gi');
+    if (re.test(filtered)) {
+      re.lastIndex = 0; // test() 후 lastIndex 리셋
+      filtered = filtered.replace(re, '🚫'.repeat(w.length));
+      hasBad = true;
+    }
+  }
+  return { ok: true, text: trimmed, filtered, hasBad };
+}
+
+function loadBans() {
+  try { return JSON.parse(fs.readFileSync(BAN_FILE, 'utf8')); } catch { return { bans: {}, mutes: {} }; }
+}
+function saveBans(b) { try { fs.writeFileSync(BAN_FILE, JSON.stringify(b, null, 2)); } catch {} }
+
+let banData = loadBans(); // { bans: {username: {until, reason}}, mutes: {username: {until, reason}} }
+
+function isBanned(username) {
+  const b = banData.bans[username];
+  if (!b) return false;
+  if (b.until === 'permanent') return true;
+  if (Date.now() < b.until) return true;
+  delete banData.bans[username]; saveBans(banData);
+  return false;
+}
+function isMuted(username) {
+  const m = banData.mutes[username];
+  if (!m) return false;
+  if (m.until === 'permanent') return true;
+  if (Date.now() < m.until) return true;
+  delete banData.mutes[username]; saveBans(banData);
+  return false;
+}
+
+// Chat log (last 500 messages)
+let chatLog = [];
+function appendChatLog(entry) {
+  chatLog.push({ ...entry, time: Date.now() });
+  if (chatLog.length > 500) chatLog.shift();
+}
+
+// Position broadcast batching (100명 최적화)
+const playerPositions = new Map(); // username -> {x,y,heroClass,level}
+let posBroadcastTimer = null;
+function schedulePosBroadcast() {
+  if (posBroadcastTimer) return;
+  posBroadcastTimer = setTimeout(() => {
+    posBroadcastTimer = null;
+    const positions = {};
+    for (const [u, p] of playerPositions) positions[u] = p;
+    if (Object.keys(positions).length === 0) return;
+    const msg = JSON.stringify({ type: 'positions_batch', positions });
+    for (const [ws, info] of clients) {
+      if (ws.readyState === 1 && info.inVillage) ws.send(msg);
+    }
+  }, 50); // 20fps batch
+}
 
 function getAllWeapons() {
   return [
@@ -157,6 +233,16 @@ function saveConfig(cfg) { fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, nul
 let gameConfig = loadConfig();
 
 let users = loadUsers();
+
+// ── saveUsers 함수 (유저 데이터를 파일에 저장) ──
+function saveUsers(u) {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(u, null, 2));
+  } catch (e) {
+    console.error('⚠️ saveUsers error:', e.message);
+  }
+}
+
 // Auto-save every 30s
 setInterval(() => saveUsers(users), 30000);
 
@@ -187,7 +273,13 @@ app.post('/api/save', (req, res) => {
   const { username, password, data } = req.body;
   const user = users[username];
   if (!user || user.password !== password) return res.json({ ok: false, msg: 'Auth failed' });
-  Object.assign(users[username], data);
+  // 안전한 필드만 허용 (isAdmin, password 등 권한 필드 차단)
+  const safeFields = ['level','exp','gold','gems','attack','defense','hp','maxHp','weapons','armors',
+    'equippedWeapon','equippedArmor','unlockedStage','inventory','customMonsters','jobClass',
+    'friends','friendRequests','craftRecipes'];
+  for (const k of safeFields) {
+    if (data[k] !== undefined) users[username][k] = data[k];
+  }
   saveUsers(users);
   res.json({ ok: true });
 });
@@ -274,6 +366,57 @@ app.get('/api/backup/:username/:password', (req, res) => {
   res.json({ version: 1, username, exportedAt: new Date().toISOString(), data: safeData });
 });
 
+// ── AI 몬스터 생성 프록시 ──
+app.post('/api/ai/generate-monster', async (req, res) => {
+  const { imageBase64, customName, username, password } = req.body;
+  if (!users[username] || users[username].password !== password) {
+    return res.json({ ok: false, msg: '인증 실패' });
+  }
+  const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+  if (!ANTHROPIC_API_KEY) {
+    return res.json({ ok: false, msg: 'API 키 없음 - Railway Variables에 ANTHROPIC_API_KEY를 추가하세요' });
+  }
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-6',
+        max_tokens: 3000,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
+            { type: 'text', text: `이 이미지를 분석해서 독창적인 판타지 RPG 픽셀아트 몬스터를 만들어줘.${customName ? ` 몬스터 이름: "${customName}"` : ''}
+
+이미지의 실제 모양, 색상, 특징을 최대한 반영해서 완전히 독특한 몬스터를 디자인해.
+
+반드시 아래 JSON 형식으로만 응답해. 다른 텍스트 없이 JSON만:
+{
+  "name": "이미지 특징을 반영한 창의적인 한국어 이름",
+  "description": "이미지 특징을 반영한 설명 한 문장",
+  "hp": 숫자(200~3000),
+  "atk": 숫자(15~250),
+  "def": 숫자(5~120),
+  "expReward": 숫자(30~400),
+  "goldReward": 숫자(20~250),
+  "svgInner": "32x36 픽셀아트 SVG 내부 rect 요소들만. viewBox 0 0 32 36 기준. shape-rendering crispEdges. rect 요소만 사용. 이미지의 실제 형태와 색상을 반영한 독창적인 디자인. 최소 30개 이상의 rect 요소로 상세하게. 눈, 입, 팔, 다리, 특이한 특징들 포함. 예시: <rect x=\\"10\\" y=\\"5\\" width=\\"12\\" height=\\"10\\" fill=\\"#ff4020\\"/>"
+}` }
+          ]
+        }]
+      })
+    });
+    const data = await response.json();
+    res.json({ ok: true, content: data.content });
+  } catch(e) {
+    res.json({ ok: false, msg: e.message });
+  }
+});
+
 function sanitize(u) {
   const { password, ...rest } = u;
   return rest;
@@ -316,6 +459,9 @@ function broadcastPartyList() {
 }
 
 wss.on('connection', (ws) => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+  ws.on('error', (err) => { console.error('⚠️ WS client error:', err.message); });
   ws.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw);
@@ -326,6 +472,15 @@ wss.on('connection', (ws) => {
     const info = clients.get(ws);
     if (info) {
       const { username, stageId } = info;
+      // 마을 playerPositions 정리
+      playerPositions.delete(username);
+      // 마을에 있었다면 퇴장 알림
+      if (info.inVillage) {
+        const leaveMsg = JSON.stringify({ type: 'village_player_leave', username });
+        for (const [ow, oi] of clients) {
+          if (oi.inVillage && oi.username !== username && ow.readyState === 1) ow.send(leaveMsg);
+        }
+      }
       // 스테이지에서 나감 알림
       if (stageId) {
         broadcastToStage(stageId, { type: 'stage_user_left', username, stageId }, username);
@@ -352,6 +507,11 @@ function handleWS(ws, msg) {
   if (msg.type === 'auth') {
     const u = users[msg.username];
     if (u && u.password === msg.password) {
+      // 밴 체크
+      if (isBanned(msg.username)) {
+        ws.send(JSON.stringify({ type: 'force_logout', msg: '계정이 정지되었습니다.' }));
+        ws.close(); return;
+      }
       clients.set(ws, { username: msg.username, stageId: null });
       ws.send(JSON.stringify({ type: 'auth_ok', user: sanitize(u) }));
       broadcast({ type: 'online', users: getOnlineUsers() });
@@ -367,25 +527,42 @@ function handleWS(ws, msg) {
   const user = users[username];
 
   if (msg.type === 'chat') {
-    const channel = msg.channel || 'global';
-    const text = msg.text?.trim();
-    if (!text) return;
+    const validChannels = ['global','guild','party','trade'];
+    const channel = validChannels.includes(msg.channel) ? msg.channel : 'global';
 
-    // Check for admin commands
-    if (user?.isAdmin && text.startsWith('/')) {
-      handleAdminCommand(ws, username, text, msg.channel);
+    // Admin commands
+    if (user?.isAdmin && msg.text?.trim().startsWith('/')) {
+      handleAdminCommand(ws, username, msg.text.trim(), channel);
       return;
     }
 
+    // Mute check
+    if (isMuted(username)) {
+      ws.send(JSON.stringify({ type: 'system', msg: '⚠️ 현재 채팅이 제한된 상태입니다.' }));
+      return;
+    }
+
+    // Filter & spam check
+    const result = filterChat(msg.text, username);
+    if (!result.ok) {
+      if (result.reason === 'spam') ws.send(JSON.stringify({ type: 'system', msg: '🚫 너무 빠르게 채팅하고 있습니다. 잠시 기다려주세요.' }));
+      return;
+    }
+
+    const displayText = result.filtered || result.text;
     const chatMsg = {
-      type: 'chat',
-      channel,
+      type: 'chat', channel,
       username,
-      text,
+      text: displayText,
+      filtered: result.hasBad,
       isAdmin: user?.isAdmin || false,
       userLevel: user?.level || 1,
       ts: Date.now()
     };
+
+    // Log
+    appendChatLog({ username, channel, original: result.text, displayed: displayText, filtered: result.hasBad });
+
     if (!chatHistory[channel]) chatHistory[channel] = [];
     chatHistory[channel].push(chatMsg);
     if (chatHistory[channel].length > 100) chatHistory[channel].shift();
@@ -398,6 +575,7 @@ function handleWS(ws, msg) {
     if (!target) { ws.send(JSON.stringify({ type: 'error', msg: '존재하지 않는 유저입니다.' })); return; }
     if (!target.friendRequests) target.friendRequests = [];
     if (target.friends?.includes(username)) { ws.send(JSON.stringify({ type: 'error', msg: '이미 친구입니다.' })); return; }
+    if (target.friendRequests.includes(username)) { ws.send(JSON.stringify({ type: 'error', msg: '이미 친구 요청을 보냈습니다.' })); return; }
     target.friendRequests.push(username);
     saveUsers(users);
     ws.send(JSON.stringify({ type: 'system', msg: `${msg.target}에게 친구 요청을 보냈습니다.` }));
@@ -409,6 +587,7 @@ function handleWS(ws, msg) {
   if (msg.type === 'friend_accept') {
     const requester = msg.from;
     if (!user.friendRequests?.includes(requester)) return;
+    if (!users[requester]) { ws.send(JSON.stringify({ type: 'error', msg: '상대방 계정이 존재하지 않습니다.' })); return; }
     user.friendRequests = user.friendRequests.filter(r => r !== requester);
     if (!user.friends) user.friends = [];
     if (!users[requester].friends) users[requester].friends = [];
@@ -430,7 +609,8 @@ function handleWS(ws, msg) {
 
   if (msg.type === 'save_game') {
     const allowed = ['level','exp','gold','gems','attack','defense','hp','maxHp','weapons','armors',
-      'equippedWeapon','equippedArmor','unlockedStage','inventory'];
+      'equippedWeapon','equippedArmor','unlockedStage','inventory',
+      'customMonsters','jobClass','friends','friendRequests'];
     for (const k of allowed) {
       if (msg.data[k] !== undefined) users[username][k] = msg.data[k];
     }
@@ -622,11 +802,17 @@ function handleWS(ws, msg) {
   if (msg.type === 'village_enter') {
     const info = clients.get(ws);
     if (!info) return;
+    // Ban check
+    if (isBanned(username)) {
+      ws.send(JSON.stringify({ type: 'force_logout', msg: '계정이 정지되었습니다.' }));
+      ws.close(); return;
+    }
     info.inVillage = true;
     info.villageX = msg.x || 50;
-    info.villageY = msg.y || 60;
+    info.villageY = msg.y || 50;
     info.heroClass = msg.heroClass || 0;
-    // Send current village players to newcomer
+    playerPositions.set(username, { x: info.villageX, y: info.villageY, heroClass: info.heroClass, level: (users[username]||{}).level||1 });
+    // Send all current village players to newcomer
     const villagers = [];
     for (const [, ci] of clients) {
       if (ci.inVillage && ci.username !== username) {
@@ -635,12 +821,11 @@ function handleWS(ws, msg) {
       }
     }
     ws.send(JSON.stringify({ type: 'village_players', players: villagers }));
-    // Announce arrival
+    // Announce arrival (batched)
     const myUser = users[username] || {};
+    const joinMsg = JSON.stringify({ type: 'village_player_join', username, x: info.villageX, y: info.villageY, heroClass: info.heroClass, level: myUser.level || 1 });
     for (const [ow, oi] of clients) {
-      if (oi.inVillage && oi.username !== username) {
-        ow.send(JSON.stringify({ type: 'village_player_join', username, x: info.villageX, y: info.villageY, heroClass: info.heroClass, level: myUser.level || 1 }));
-      }
+      if (oi.inVillage && oi.username !== username && ow.readyState === 1) ow.send(joinMsg);
     }
     return;
   }
@@ -650,11 +835,13 @@ function handleWS(ws, msg) {
     if (!info || !info.inVillage) return;
     info.villageX = msg.x;
     info.villageY = msg.y;
-    for (const [ow, oi] of clients) {
-      if (oi.inVillage && oi.username !== username) {
-        ow.send(JSON.stringify({ type: 'village_player_move', username, x: msg.x, y: msg.y }));
-      }
-    }
+    // Update position map and schedule batch broadcast
+    playerPositions.set(username, {
+      x: msg.x, y: msg.y,
+      heroClass: info.heroClass || 0,
+      level: (users[username]||{}).level || 1
+    });
+    schedulePosBroadcast();
     return;
   }
 
@@ -662,11 +849,74 @@ function handleWS(ws, msg) {
     const info = clients.get(ws);
     if (!info) return;
     info.inVillage = false;
+    playerPositions.delete(username);
+    const leaveMsg = JSON.stringify({ type: 'village_player_leave', username });
     for (const [ow, oi] of clients) {
-      if (oi.inVillage && oi.username !== username) {
-        ow.send(JSON.stringify({ type: 'village_player_leave', username }));
-      }
+      if (oi.inVillage && oi.username !== username && ow.readyState === 1) ow.send(leaveMsg);
     }
+    return;
+  }
+
+  // ── 처벌 시스템 ──
+  if (msg.type === 'admin_punish') {
+    if (!user?.isAdmin) return;
+    const { target, punishType, duration, reason } = msg;
+    if (!users[target]) { ws.send(JSON.stringify({ type:'system', msg:'유저를 찾을 수 없습니다.' })); return; }
+    const dur = parseInt(duration);
+    const until = duration === 'permanent' ? 'permanent' : (isNaN(dur) ? Date.now() + 3600000 : Date.now() + dur);
+    if (punishType === 'ban') {
+      banData.bans[target] = { until, reason, by: username };
+      saveBans(banData);
+      sendToUser(target, { type: 'force_logout', msg: `계정이 정지되었습니다. 사유: ${reason}` });
+      broadcast({ type: 'system', msg: `🔨 [관리자] ${target}이(가) 밴되었습니다. 사유: ${reason}` });
+    } else if (punishType === 'mute') {
+      banData.mutes[target] = { until, reason, by: username };
+      saveBans(banData);
+      sendToUser(target, { type: 'system', msg: `⚠️ 채팅이 제한되었습니다. 사유: ${reason}` });
+    } else if (punishType === 'kick') {
+      sendToUser(target, { type: 'force_logout', msg: `관리자에 의해 강제 퇴장되었습니다. 사유: ${reason}` });
+    }
+    ws.send(JSON.stringify({ type: 'system', msg: `✅ ${target} ${punishType} 처리 완료` }));
+    return;
+  }
+
+  if (msg.type === 'admin_unpunish') {
+    if (!user?.isAdmin) return;
+    const { target, punishType } = msg;
+    if (punishType === 'ban') delete banData.bans[target];
+    else delete banData.mutes[target];
+    saveBans(banData);
+    ws.send(JSON.stringify({ type: 'system', msg: `✅ ${target} ${punishType} 해제 완료` }));
+    return;
+  }
+
+  if (msg.type === 'admin_kick_all') {
+    if (!user?.isAdmin) return;
+    const kickMsg = JSON.stringify({ type: 'force_logout', msg: '관리자에 의해 강제 퇴장되었습니다.' });
+    for (const [ow, oi] of clients) {
+      if (oi.username !== username && ow.readyState === 1) ow.send(kickMsg);
+    }
+    return;
+  }
+
+  if (msg.type === 'admin_heal_all') {
+    if (!user?.isAdmin) return;
+    broadcast({ type: 'admin_heal_all' });
+    return;
+  }
+
+  if (msg.type === 'admin_add_badword') {
+    if (!user?.isAdmin) return;
+    CHAT_FILTER_KO.push(msg.word);
+    ws.send(JSON.stringify({ type: 'system', msg: `🚫 금지어 추가: "${msg.word}"` }));
+    return;
+  }
+
+  if (msg.type === 'admin_remove_badword') {
+    if (!user?.isAdmin) return;
+    const idx = CHAT_FILTER_KO.indexOf(msg.word);
+    if (idx >= 0) CHAT_FILTER_KO.splice(idx, 1);
+    ws.send(JSON.stringify({ type: 'system', msg: `✅ 금지어 제거: "${msg.word}"` }));
     return;
   }
 }
@@ -789,9 +1039,13 @@ function broadcast(data) {
 
 function broadcastChannel(channel, data) {
   const str = JSON.stringify(data);
-  wss.clients.forEach(c => {
-    if (c.readyState === 1) c.send(str);
-  });
+  if (channel === 'global') {
+    // 글로벌 채널: 전체 전송
+    wss.clients.forEach(c => { if (c.readyState === 1) c.send(str); });
+  } else {
+    // 그 외 채널: 해당 채널 구독자에게만 (현재는 전체 전송, 향후 채널 구독 기능 추가 가능)
+    wss.clients.forEach(c => { if (c.readyState === 1) c.send(str); });
+  }
 }
 
 function sendToUser(username, data) {
@@ -802,6 +1056,58 @@ function sendToUser(username, data) {
     }
   }
 }
+
+// ── 처벌 조회 API ──
+app.get('/api/admin/punishments', (req, res) => {
+  const { adminUser, adminPass } = req.query;
+  if (adminUser !== ADMIN_ID || adminPass !== ADMIN_PW) return res.json({ ok: false });
+  res.json({ ok: true, bans: banData.bans, mutes: banData.mutes });
+});
+
+// ── 채팅 로그 API ──
+app.get('/api/admin/chatlog', (req, res) => {
+  const { adminUser, adminPass } = req.query;
+  if (adminUser !== ADMIN_ID || adminPass !== ADMIN_PW) return res.json({ ok: false });
+  res.json({ ok: true, log: chatLog });
+});
+
+// ── SPAM_TRACKER 메모리 누수 방지 (5분마다 오래된 항목 정리) ──
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of SPAM_TRACKER) {
+    if (now - val.lastTime > 60000) SPAM_TRACKER.delete(key);
+  }
+}, 300000);
+
+// ── 서버 크래시 방지: 에러 핸들링 강화 ──
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught:', err.message, err.stack);
+  // 치명적이지 않은 에러는 서버 계속 실행
+});
+process.on('unhandledRejection', (r) => {
+  console.error('⚠️ Rejection:', r);
+});
+
+// ── WebSocket 에러 핸들링 ──
+wss.on('error', (err) => {
+  console.error('⚠️ WSS Error:', err.message);
+});
+
+// ── 하트비트: 죽은 연결 정리 (30초마다) ──
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.isAlive === false) {
+      const info = clients.get(ws);
+      if (info) {
+        playerPositions.delete(info.username);
+        clients.delete(ws);
+      }
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`🎮 서버 실행중: port ${PORT}`));
